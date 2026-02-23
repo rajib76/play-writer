@@ -1,0 +1,136 @@
+# agent.py
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List, TypedDict, Optional
+
+from google.adk.agents.llm_agent import Agent
+from google.adk.models.lite_llm import LiteLlm  # ADK wrapper over LiteLLM :contentReference[oaicite:1]{index=1}
+
+
+# -------------------------
+# Slot spec you pass in
+# -------------------------
+class SlotSpec(TypedDict, total=False):
+    slot_name: str                  # required
+    type: str                       # required (string/date/enum/int/etc.)
+    description: str                # required
+    valid_values: List[str]         # optional (for enums or constrained values)
+    value: Any                      # optional current extracted value (None/"" if missing)
+    confidence: float               # optional 0..1 (if you have it)
+    required: bool                  # optional (default True)
+
+
+# -------------------------
+# Output schema
+# -------------------------
+class DisambiguationQuestion(TypedDict):
+    slot_name: str
+    question: str
+    reason: str
+
+
+class DisambiguationResult(TypedDict):
+    needs_clarification: bool
+    questions: List[DisambiguationQuestion]
+    normalized: Dict[str, Any]
+
+
+# -------------------------
+# Tool: validate LLM output
+# -------------------------
+def validate_disambiguation_output(result_json: str) -> DisambiguationResult:
+    """
+    The LLM will emit a JSON string. This tool validates it so your orchestration
+    can rely on a strict schema.
+    """
+    obj = json.loads(result_json)
+
+    if "needs_clarification" not in obj or not isinstance(obj["needs_clarification"], bool):
+        raise ValueError("needs_clarification must be a boolean.")
+
+    if "questions" not in obj or not isinstance(obj["questions"], list):
+        raise ValueError("questions must be a list.")
+
+    for i, q in enumerate(obj["questions"]):
+        if not isinstance(q, dict):
+            raise ValueError(f"questions[{i}] must be an object.")
+        for k in ("slot_name", "question", "reason"):
+            if k not in q or not isinstance(q[k], str) or not q[k].strip():
+                raise ValueError(f"questions[{i}].{k} must be a non-empty string.")
+
+    normalized = obj.get("normalized", {})
+    if not isinstance(normalized, dict):
+        raise ValueError("normalized must be an object/dict.")
+
+    return {
+        "needs_clarification": obj["needs_clarification"],
+        "questions": obj["questions"],
+        "normalized": normalized,
+    }
+
+
+# -------------------------
+# OpenAI model via LiteLlm
+# -------------------------
+# Requirements:
+#   pip install "google-adk" litellm
+#   export OPENAI_API_KEY="..."
+#
+# Model string format is LiteLLM style: "openai/<model-name>" :contentReference[oaicite:2]{index=2}
+openai_model = LiteLlm(model="openai/gpt-4o-mini")
+
+
+# -------------------------
+# Agent
+# -------------------------
+root_agent = Agent(
+    name="intent_disambiguation_agent",
+    model=openai_model,
+    description="Crafts clarifying questions from intent + prompt + slot specs.",
+    instruction="""
+You are an Intent Disambiguation Agent.
+
+Inputs you will receive:
+- intent: string
+- prompt: string (user's original request)
+- slots: JSON array of slot objects, each with:
+  slot_name, type, description, valid_values (optional),
+  value (optional), confidence (optional), required (optional; default true)
+
+Goal:
+Determine if you can proceed without guessing. If not, ask the smallest set of
+clarifying questions needed to disambiguate.
+
+Ask questions only for these conditions:
+1) Missing required slot: value is null/empty
+2) Ambiguous value: value is a list with more than 1 candidate
+3) Invalid value: valid_values exists and current value is not in it
+4) Low confidence: confidence exists and is < 0.75 (confirm it)
+
+Question rules:
+- Each question must be tied to exactly one slot_name.
+- Keep questions short and friendly.
+- If valid_values exists, prefer offering choices.
+- Do not ask redundant questions.
+- Do not invent slot values.
+
+Output format:
+You MUST output ONLY a JSON string exactly matching:
+{
+  "needs_clarification": true|false,
+  "questions": [
+    {"slot_name":"...", "question":"...", "reason":"..."}
+  ],
+  "normalized": { "slot_name": <value>, ... }
+}
+
+If needs_clarification is false:
+- normalized must include a key for every provided slot_name
+- use the provided slot.value as-is (no new inference)
+
+After producing the JSON string, call the tool:
+validate_disambiguation_output(result_json=<your JSON string>)
+""".strip(),
+    tools=[validate_disambiguation_output],
+)
